@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: migration-test
+  namespace: default
+  labels:
+    app: migration-test
+spec:
+  selector:
+    app: migration-test
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+  type: ClusterIP
