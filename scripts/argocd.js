@@ -1,6 +1,6 @@
 const https = require("https");
 const { info, success, error, warn, section, c } = require("./logger");
-const { run, sleep } = require("./utils");
+const { run, sleep } = require("./utils"); // run used for argoLogin password fetch
 const {
   APP_NAME,
   NAMESPACE,
@@ -67,6 +67,44 @@ async function argoGetApp(token) {
   const res = await httpRequest("GET", `/api/v1/applications/${APP_NAME}`, null, token);
   if (res.status !== 200) throw new Error(`Failed to get app: ${JSON.stringify(res.body)}`);
   return res.body;
+}
+
+async function argoGetResourceTree(token) {
+  const res = await httpRequest("GET", `/api/v1/applications/${APP_NAME}/resource-tree`, null, token);
+  if (res.status !== 200) throw new Error(`Failed to get resource tree: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+function printPodTable(nodes) {
+  const pods = nodes.filter((n) => n.kind === "Pod");
+
+  if (!pods.length) {
+    warn("No pods found in ArgoCD resource tree.");
+    return;
+  }
+
+  const healthColor = (h) =>
+    h === "Healthy"     ? c.green
+    : h === "Progressing" ? c.yellow
+    : h === "Degraded"    ? c.red
+    : c.gray;
+
+  const col = (str, width) => String(str || "-").padEnd(width);
+
+  console.log(
+    `  ${c.bold}${col("NAME", 45)} ${col("HEALTH", 14)} ${col("MESSAGE", 40)}${c.reset}`,
+  );
+  console.log(`  ${"─".repeat(100)}`);
+
+  for (const pod of pods) {
+    const name    = pod.name || "-";
+    const health  = pod.health?.status  || "Unknown";
+    const message = pod.health?.message || "";
+    const hc      = healthColor(health);
+    console.log(
+      `  ${c.gray}${col(name, 45)}${c.reset} ${hc}${c.bold}${col(health, 14)}${c.reset} ${c.gray}${message}${c.reset}`,
+    );
+  }
 }
 
 // -- Wait for ArgoCD to auto-detect the new revision and finish syncing --------
@@ -149,15 +187,15 @@ async function waitForAutoSync(token, expectedRevision) {
     await sleep(INTERVAL);
   }
 
-  // Final pod status
+  // Final pod status via ArgoCD resource tree API
   console.log("");
   section("Pod Status");
-  const pods = await run(
-    "oc",
-    ["get", "pods", "-n", NAMESPACE, "-l", `app=${APP_NAME}`],
-    { ignoreError: true },
-  );
-  console.log(pods || "No pods found.");
+  try {
+    const tree = await argoGetResourceTree(token);
+    printPodTable(tree.nodes || []);
+  } catch (err) {
+    warn(`Could not fetch pod status from ArgoCD: ${err.message}`);
+  }
 }
 
 module.exports = { argoLogin, waitForAutoSync };
