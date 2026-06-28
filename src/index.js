@@ -28,7 +28,7 @@ const server = http.createServer((req, res) => {
   }
 });
 
-throw new Error("Random Error 1");
+throw new Error("Random Error 2");
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
