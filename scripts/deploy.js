@@ -4,11 +4,13 @@ const { c, error } = require("./logger");
 const { gitCommitAndPush } = require("./git");
 const { ocBuild } = require("./build");
 const { argoLogin, waitForAutoSync } = require("./argocd");
+const { cleanup } = require("./cleanup");
 
 async function main() {
   console.log(`\n${c.bold}${c.cyan}  Deploy Script - migration-test${c.reset}\n`);
 
   try {
+    await cleanup();
     await ocBuild();
     const revision = await gitCommitAndPush();
     const token = await argoLogin();
