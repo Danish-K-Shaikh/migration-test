@@ -30,4 +30,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  throw new Error("Random Error");
 });
