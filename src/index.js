@@ -1,15 +1,17 @@
-const http = require('http');
+const http = require("http");
 
 const PORT = process.env.PORT || 3000;
 
 const routes = {
-  '/health': (res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+  "/health": (res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }),
+    );
   },
-  '/hello': (res) => {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ message: 'Hello, World!' }));
+  "/hello": (res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ message: "Good morning, World!" }));
   },
 };
 
@@ -21,8 +23,8 @@ const server = http.createServer((req, res) => {
     handler(res);
   } else {
     console.log(`[${timestamp}] ${req.method} ${req.url} - 404`);
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not Found' }));
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not Found" }));
   }
 });
 
