@@ -24,7 +24,9 @@ async function gitCommitAndPush() {
   info("Pushing to remote...");
   await run("git", ["push"]);
 
-  success("Code pushed successfully.");
+  const revision = await run("git", ["rev-parse", "HEAD"]);
+  success(`Code pushed successfully. Revision: ${revision.slice(0, 7)}`);
+  return revision;
 }
 
 module.exports = { gitCommitAndPush };

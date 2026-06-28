@@ -3,18 +3,16 @@
 const { c, error } = require("./logger");
 const { gitCommitAndPush } = require("./git");
 const { ocBuild } = require("./build");
-const { argoSync, watchStatus } = require("./argocd");
+const { argoLogin, waitForAutoSync } = require("./argocd");
 
 async function main() {
-  console.log(
-    `\n${c.bold}${c.cyan}  Deploy Script - migration-test${c.reset}\n`,
-  );
+  console.log(`\n${c.bold}${c.cyan}  Deploy Script - migration-test${c.reset}\n`);
 
   try {
     await ocBuild();
-    await gitCommitAndPush();
-    await argoSync();
-    await watchStatus();
+    const revision = await gitCommitAndPush();
+    const token = await argoLogin();
+    await waitForAutoSync(token, revision);
     console.log(`\n${c.green}${c.bold}  Done!${c.reset}\n`);
   } catch (err) {
     console.log("");

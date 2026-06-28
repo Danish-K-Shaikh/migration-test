@@ -1,7 +1,14 @@
 const https = require("https");
 const { info, success, error, warn, section, c } = require("./logger");
 const { run, sleep } = require("./utils");
-const { APP_NAME, NAMESPACE, ARGOCD_NAMESPACE, ARGOCD_SERVER, ARGOCD_USERNAME, ARGOCD_PASSWORD } = require("./config");
+const {
+  APP_NAME,
+  NAMESPACE,
+  ARGOCD_NAMESPACE,
+  ARGOCD_SERVER,
+  ARGOCD_USERNAME,
+  ARGOCD_PASSWORD,
+} = require("./config");
 
 const tlsAgent = new https.Agent({ rejectUnauthorized: false });
 
@@ -48,7 +55,10 @@ async function argoLogin() {
       "-o", "jsonpath={.data.admin\\.password}",
     ]).then((b64) => Buffer.from(b64, "base64").toString()));
 
-  const res = await httpRequest("POST", "/api/v1/session", { username: ARGOCD_USERNAME, password });
+  const res = await httpRequest("POST", "/api/v1/session", {
+    username: ARGOCD_USERNAME,
+    password,
+  });
   if (res.status !== 200) throw new Error(`ArgoCD login failed: ${JSON.stringify(res.body)}`);
   return res.body.token;
 }
@@ -59,82 +69,95 @@ async function argoGetApp(token) {
   return res.body;
 }
 
-async function argoSync() {
-  section("ArgoCD - Trigger Sync");
+// -- Wait for ArgoCD to auto-detect the new revision and finish syncing --------
 
-  info("Triggering ArgoCD sync...");
-  await run("oc", [
-    "patch", "application", APP_NAME,
-    "-n", ARGOCD_NAMESPACE,
-    "--type", "merge",
-    "-p", JSON.stringify({
-      operation: {
-        initiatedBy: { username: "deploy-script" },
-        sync: { revision: "HEAD", prune: true },
-      },
-    }),
-  ]);
+async function waitForAutoSync(token, expectedRevision) {
+  section("ArgoCD - Waiting for Auto-Sync");
 
-  success("Sync triggered.");
-}
+  const short = expectedRevision.slice(0, 7);
+  info(`Watching for ArgoCD to pick up revision ${c.cyan}${short}${c.reset}...\n`);
 
-async function watchStatus() {
-  section("ArgoCD - Deployment Status");
-
-  info("Authenticating with ArgoCD API...");
-  const token = await argoLogin();
-  success(`Authenticated → https://${ARGOCD_SERVER}`);
-
-  const MAX_WAIT = 5 * 60 * 1000;
+  const MAX_WAIT = 10 * 60 * 1000; // ArgoCD polls git every ~3 min by default
   const INTERVAL = 5000;
   const start = Date.now();
-
-  info("Polling ArgoCD API for sync and health status...\n");
+  let phase = "detecting"; // detecting → syncing → healthy
 
   while (Date.now() - start < MAX_WAIT) {
     const app = await argoGetApp(token);
-    const sync    = app.status?.sync?.status    || "Unknown";
-    const health  = app.status?.health?.status  || "Unknown";
-    const message = app.status?.operationState?.message || "";
+    const syncedRevision = app.status?.sync?.revision || "";
+    const syncStatus     = app.status?.sync?.status   || "Unknown";
+    const health         = app.status?.health?.status  || "Unknown";
+    const opPhase        = app.status?.operationState?.phase || "";
+    const opMessage      = app.status?.operationState?.message || "";
+    const elapsed        = Math.round((Date.now() - start) / 1000);
+    const revMatches     = syncedRevision.startsWith(short) || expectedRevision.startsWith(syncedRevision.slice(0, 7));
 
-    const syncColor   = sync   === "Synced"     ? c.green : c.yellow;
-    const healthColor = health === "Healthy"     ? c.green
-                      : health === "Progressing" ? c.yellow : c.red;
+    if (phase === "detecting") {
+      const countdown = Math.max(0, 180 - elapsed);
+      process.stdout.write(
+        `\r  ${c.yellow}${c.bold}Waiting for ArgoCD to detect changes...${c.reset}` +
+        `  ${c.gray}revision: ${short}  elapsed: ${elapsed}s  (next poll ~${countdown}s)${c.reset}  `,
+      );
 
-    process.stdout.write(
-      `\r  Sync: ${syncColor}${c.bold}${sync.padEnd(10)}${c.reset}` +
-      `  Health: ${healthColor}${c.bold}${health.padEnd(12)}${c.reset}` +
-      `  ${c.gray}(${Math.round((Date.now() - start) / 1000)}s elapsed)${c.reset}  `,
-    );
+      if (revMatches && opPhase === "Running") {
+        console.log("\n");
+        success(`ArgoCD detected revision ${short} — sync started.`);
+        phase = "syncing";
+      } else if (revMatches && syncStatus === "Synced") {
+        console.log("\n");
+        success(`ArgoCD already synced to revision ${short}.`);
+        phase = "syncing";
+      }
+    } else if (phase === "syncing") {
+      const syncColor   = syncStatus === "Synced"      ? c.green : c.yellow;
+      const healthColor = health     === "Healthy"     ? c.green
+                        : health     === "Progressing" ? c.yellow : c.red;
 
-    if (sync === "Synced" && health === "Healthy") {
-      console.log("\n");
-      success("Application is Synced and Healthy!");
-      break;
-    }
+      process.stdout.write(
+        `\r  Sync: ${syncColor}${c.bold}${syncStatus.padEnd(10)}${c.reset}` +
+        `  Health: ${healthColor}${c.bold}${health.padEnd(12)}${c.reset}` +
+        `  Op: ${c.gray}${(opPhase || "-").padEnd(10)}${c.reset}` +
+        `  ${c.gray}(${elapsed}s elapsed)${c.reset}  `,
+      );
 
-    if (health === "Degraded") {
-      console.log("\n");
-      error("Application health is Degraded.");
-      if (message) error(`Reason: ${message}`);
-      break;
+      if (syncStatus === "Synced" && health === "Healthy") {
+        console.log("\n");
+        success("Deployment complete — Synced and Healthy!");
+        break;
+      }
+
+      if (health === "Degraded") {
+        console.log("\n");
+        error("Deployment degraded.");
+        if (opMessage) error(`Reason: ${opMessage}`);
+        break;
+      }
+
+      if (opPhase === "Failed") {
+        console.log("\n");
+        error(`Sync failed: ${opMessage}`);
+        break;
+      }
     }
 
     if (Date.now() - start >= MAX_WAIT) {
       console.log("\n");
-      warn("Timed out waiting for healthy status.");
+      warn("Timed out waiting for auto-sync. Check ArgoCD UI for details.");
       break;
     }
 
     await sleep(INTERVAL);
   }
 
+  // Final pod status
   console.log("");
   section("Pod Status");
-  const pods = await run("oc", ["get", "pods", "-n", NAMESPACE, "-l", `app=${APP_NAME}`], {
-    ignoreError: true,
-  });
+  const pods = await run(
+    "oc",
+    ["get", "pods", "-n", NAMESPACE, "-l", `app=${APP_NAME}`],
+    { ignoreError: true },
+  );
   console.log(pods || "No pods found.");
 }
 
-module.exports = { argoSync, watchStatus };
+module.exports = { argoLogin, waitForAutoSync };
