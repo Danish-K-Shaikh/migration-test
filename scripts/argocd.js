@@ -11,6 +11,9 @@ const {
 } = require("./config");
 
 const tlsAgent = new https.Agent({ rejectUnauthorized: false });
+const MAX_RESTARTS = 3;
+
+// -- HTTP helpers --------------------------------------------------------------
 
 function httpRequest(method, path, body, token) {
   return new Promise((resolve, reject) => {
@@ -46,6 +49,51 @@ function httpRequest(method, path, body, token) {
   });
 }
 
+// Collects NDJSON log stream — each line: {"result":{"content":"...","podName":"..."}}
+function fetchPodLogs(token, podName, container) {
+  return new Promise((resolve, reject) => {
+    const qs = new URLSearchParams({
+      podName,
+      namespace: NAMESPACE,
+      container: container || APP_NAME,
+      tailLines: "50",
+    });
+
+    const options = {
+      hostname: ARGOCD_SERVER,
+      port: 443,
+      path: `/api/v1/applications/${APP_NAME}/logs?${qs}`,
+      method: "GET",
+      agent: tlsAgent,
+      headers: { Authorization: `Bearer ${token}` },
+    };
+
+    const req = https.request(options, (res) => {
+      let raw = "";
+      res.on("data", (chunk) => (raw += chunk));
+      res.on("end", () => {
+        const lines = raw
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            try {
+              return JSON.parse(line)?.result?.content || "";
+            } catch {
+              return line;
+            }
+          })
+          .filter(Boolean);
+        resolve(lines);
+      });
+    });
+
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// -- ArgoCD API calls ---------------------------------------------------------
+
 async function argoLogin() {
   const password =
     ARGOCD_PASSWORD ||
@@ -75,39 +123,93 @@ async function argoGetResourceTree(token) {
   return res.body;
 }
 
+async function argoGetPodManifest(token, podName) {
+  const qs = new URLSearchParams({
+    namespace: NAMESPACE,
+    resourceName: podName,
+    version: "v1",
+    kind: "Pod",
+    group: "",
+  });
+  const res = await httpRequest("GET", `/api/v1/applications/${APP_NAME}/resource?${qs}`, null, token);
+  if (res.status !== 200) return null;
+  try {
+    return JSON.parse(res.body.manifest);
+  } catch {
+    return null;
+  }
+}
+
+// -- Pod helpers --------------------------------------------------------------
+
 function printPodTable(nodes) {
   const pods = nodes.filter((n) => n.kind === "Pod");
-
   if (!pods.length) {
     warn("No pods found in ArgoCD resource tree.");
     return;
   }
 
   const healthColor = (h) =>
-    h === "Healthy"     ? c.green
+    h === "Healthy"      ? c.green
     : h === "Progressing" ? c.yellow
     : h === "Degraded"    ? c.red
     : c.gray;
 
   const col = (str, width) => String(str || "-").padEnd(width);
 
-  console.log(
-    `  ${c.bold}${col("NAME", 45)} ${col("HEALTH", 14)} ${col("MESSAGE", 40)}${c.reset}`,
-  );
-  console.log(`  ${"─".repeat(100)}`);
+  console.log(`  ${c.bold}${col("NAME", 45)} ${col("RESTARTS", 10)} ${col("HEALTH", 14)} ${col("MESSAGE", 40)}${c.reset}`);
+  console.log(`  ${"─".repeat(110)}`);
 
   for (const pod of pods) {
-    const name    = pod.name || "-";
-    const health  = pod.health?.status  || "Unknown";
-    const message = pod.health?.message || "";
-    const hc      = healthColor(health);
+    const name     = pod.name || "-";
+    const health   = pod.health?.status  || "Unknown";
+    const message  = pod.health?.message || "";
+    const restarts = pod.info?.find((i) => i.name === "Restarts")?.value || "-";
+    const hc       = healthColor(health);
     console.log(
-      `  ${c.gray}${col(name, 45)}${c.reset} ${hc}${c.bold}${col(health, 14)}${c.reset} ${c.gray}${message}${c.reset}`,
+      `  ${c.gray}${col(name, 45)}${c.reset}` +
+      ` ${c.yellow}${col(restarts, 10)}${c.reset}` +
+      ` ${hc}${c.bold}${col(health, 14)}${c.reset}` +
+      ` ${c.gray}${message}${c.reset}`,
     );
   }
 }
 
-// -- Wait for ArgoCD to auto-detect the new revision and finish syncing --------
+async function printPodLogs(token, podName) {
+  section(`Logs — ${podName}`);
+  try {
+    const lines = await fetchPodLogs(token, podName, APP_NAME);
+    if (!lines.length) {
+      warn("No logs returned.");
+      return;
+    }
+    lines.forEach((line) => console.log(`  ${c.gray}${line}${c.reset}`));
+  } catch (err) {
+    warn(`Could not fetch logs: ${err.message}`);
+  }
+}
+
+// Returns pods that have restarted more than MAX_RESTARTS times
+async function findCrashingPods(token, nodes) {
+  const podNodes = nodes.filter((n) => n.kind === "Pod");
+  const crashing = [];
+
+  for (const node of podNodes) {
+    const manifest = await argoGetPodManifest(token, node.name);
+    if (!manifest) continue;
+
+    const containerStatuses = manifest.status?.containerStatuses || [];
+    const totalRestarts = containerStatuses.reduce((sum, cs) => sum + (cs.restartCount || 0), 0);
+
+    if (totalRestarts > MAX_RESTARTS) {
+      crashing.push({ name: node.name, restarts: totalRestarts });
+    }
+  }
+
+  return crashing;
+}
+
+// -- Auto-sync watcher --------------------------------------------------------
 
 async function waitForAutoSync(token, expectedRevision) {
   section("ArgoCD - Waiting for Auto-Sync");
@@ -115,21 +217,24 @@ async function waitForAutoSync(token, expectedRevision) {
   const short = expectedRevision.slice(0, 7);
   info(`Watching for ArgoCD to pick up revision ${c.cyan}${short}${c.reset}...\n`);
 
-  const MAX_WAIT = 10 * 60 * 1000; // ArgoCD polls git every ~3 min by default
+  const MAX_WAIT = 10 * 60 * 1000;
   const INTERVAL = 5000;
-  const start = Date.now();
-  let phase = "detecting"; // detecting → syncing → healthy
+  const start    = Date.now();
+  let phase      = "detecting"; // detecting → syncing
+  let crashed    = false;
 
   while (Date.now() - start < MAX_WAIT) {
-    const app = await argoGetApp(token);
-    const syncedRevision = app.status?.sync?.revision || "";
-    const syncStatus     = app.status?.sync?.status   || "Unknown";
-    const health         = app.status?.health?.status  || "Unknown";
-    const opPhase        = app.status?.operationState?.phase || "";
+    const app            = await argoGetApp(token);
+    const syncedRevision = app.status?.sync?.revision    || "";
+    const syncStatus     = app.status?.sync?.status      || "Unknown";
+    const health         = app.status?.health?.status    || "Unknown";
+    const opPhase        = app.status?.operationState?.phase   || "";
     const opMessage      = app.status?.operationState?.message || "";
     const elapsed        = Math.round((Date.now() - start) / 1000);
-    const revMatches     = syncedRevision.startsWith(short) || expectedRevision.startsWith(syncedRevision.slice(0, 7));
+    const revMatches     = syncedRevision.startsWith(short) ||
+                           expectedRevision.startsWith(syncedRevision.slice(0, 7));
 
+    // ── Phase: detecting ────────────────────────────────────────────────────
     if (phase === "detecting") {
       const countdown = Math.max(0, 180 - elapsed);
       process.stdout.write(
@@ -146,8 +251,10 @@ async function waitForAutoSync(token, expectedRevision) {
         success(`ArgoCD already synced to revision ${short}.`);
         phase = "syncing";
       }
+
+    // ── Phase: syncing ──────────────────────────────────────────────────────
     } else if (phase === "syncing") {
-      const syncColor   = syncStatus === "Synced"      ? c.green : c.yellow;
+      const syncColor   = syncStatus === "Synced"      ? c.green  : c.yellow;
       const healthColor = health     === "Healthy"     ? c.green
                         : health     === "Progressing" ? c.yellow : c.red;
 
@@ -157,6 +264,24 @@ async function waitForAutoSync(token, expectedRevision) {
         `  Op: ${c.gray}${(opPhase || "-").padEnd(10)}${c.reset}` +
         `  ${c.gray}(${elapsed}s elapsed)${c.reset}  `,
       );
+
+      // Check for crashing pods
+      try {
+        const tree = await argoGetResourceTree(token);
+        const crashingPods = await findCrashingPods(token, tree.nodes || []);
+
+        if (crashingPods.length) {
+          console.log("\n");
+          for (const pod of crashingPods) {
+            error(`Pod ${c.bold}${pod.name}${c.reset}${c.red} has restarted ${pod.restarts} times (limit: ${MAX_RESTARTS}).`);
+            await printPodLogs(token, pod.name);
+          }
+          crashed = true;
+          break;
+        }
+      } catch {
+        // Non-fatal — continue watching
+      }
 
       if (syncStatus === "Synced" && health === "Healthy") {
         console.log("\n");
@@ -187,7 +312,7 @@ async function waitForAutoSync(token, expectedRevision) {
     await sleep(INTERVAL);
   }
 
-  // Final pod status via ArgoCD resource tree API
+  // Final pod status
   console.log("");
   section("Pod Status");
   try {
@@ -195,6 +320,10 @@ async function waitForAutoSync(token, expectedRevision) {
     printPodTable(tree.nodes || []);
   } catch (err) {
     warn(`Could not fetch pod status from ArgoCD: ${err.message}`);
+  }
+
+  if (crashed) {
+    process.exit(1);
   }
 }
 
