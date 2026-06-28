@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: migration-test
-          image: image-registry.openshift-image-registry.svc:5000/default/migration-test:495d9ce
+          image: image-registry.openshift-image-registry.svc:5000/default/migration-test:a23631d
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
