@@ -15,9 +15,12 @@ const routes = {
 
 const server = http.createServer((req, res) => {
   const handler = routes[req.url];
+  const timestamp = new Date().toISOString();
   if (handler) {
+    console.log(`[${timestamp}] ${req.method} ${req.url} - 200`);
     handler(res);
   } else {
+    console.log(`[${timestamp}] ${req.method} ${req.url} - 404`);
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not Found' }));
   }
