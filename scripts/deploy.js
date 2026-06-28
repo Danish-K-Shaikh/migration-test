@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const { APP_NAME, NAMESPACE, ARGOCD_NAMESPACE } = require("./config");
 const { c, info, error } = require("./logger");
 const { gitCommit, getLatestRevision, gitPush } = require("./git");
 const { ocBuild, updateDeploymentImage } = require("./build");
@@ -7,32 +8,23 @@ const { argoLogin, waitForAutoSync } = require("./argocd");
 const { cleanup } = require("./cleanup");
 
 async function main() {
-  console.log(`\n${c.bold}${c.cyan}  Deploy Script - migration-test${c.reset}\n`);
+  console.log(`\n${c.bold}${c.cyan}  Deploy Script - ${APP_NAME}${c.reset}\n`);
 
   try {
-    // 1. Clean evicted pods and old builds
-    await cleanup();
+    await cleanup(NAMESPACE);
 
-    // 2. Commit current changes (no push)
     await gitCommit();
-
-    // 3. Get the revision of that commit
     const revision = await getLatestRevision();
     info(`Revision: ${c.cyan}${revision}${c.reset}`);
 
-    // 4. Build image and tag it with the revision
-    await ocBuild(revision);
+    await ocBuild(APP_NAME, NAMESPACE, revision);
+    await updateDeploymentImage(APP_NAME, NAMESPACE, revision);
 
-    // 5. Update deployment.yaml with the new image tag
-    await updateDeploymentImage(revision);
-
-    // 6. Commit the manifest update and push everything
     await gitCommit(`deploy: update image tag to ${revision}`);
     const pushRevision = await gitPush();
 
-    // 7. Login to ArgoCD and wait for auto-sync
-    const token = await argoLogin();
-    await waitForAutoSync(token, pushRevision);
+    const token = await argoLogin(ARGOCD_NAMESPACE);
+    await waitForAutoSync(token, pushRevision, APP_NAME, NAMESPACE);
 
     console.log(`\n${c.green}${c.bold}  Done!${c.reset}\n`);
   } catch (err) {

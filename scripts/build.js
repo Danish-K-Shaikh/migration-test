@@ -2,43 +2,32 @@ const fs = require("fs");
 const path = require("path");
 const { info, success, section } = require("./logger");
 const { run } = require("./utils");
-const { APP_NAME, NAMESPACE, PROJECT_DIR } = require("./config");
+const { PROJECT_DIR } = require("./config");
 
 const DEPLOYMENT_YAML = path.join(PROJECT_DIR, "argocd", "deployment.yaml");
-const IMAGE_BASE = `image-registry.openshift-image-registry.svc:5000/${NAMESPACE}/${APP_NAME}`;
 
-async function ocBuild(revision) {
+async function ocBuild(appName, namespace, revision) {
   section("OpenShift - Build & Push Image");
 
-  info(`Starting build for ${APP_NAME}...`);
-  await run(
-    "oc",
-    ["start-build", APP_NAME, `--from-dir=${PROJECT_DIR}`, "--follow", "-n", NAMESPACE],
-    { stream: true },
-  );
+  info(`Starting build for ${appName}...`);
+  await run("oc", ["start-build", appName, `--from-dir=${PROJECT_DIR}`, "--follow", "-n", namespace], {
+    stream: true,
+  });
 
-  info(`Tagging image as ${APP_NAME}:${revision}...`);
-  await run("oc", [
-    "tag",
-    `${APP_NAME}:latest`,
-    `${APP_NAME}:${revision}`,
-    "-n", NAMESPACE,
-  ]);
+  info(`Tagging image as ${appName}:${revision}...`);
+  await run("oc", ["tag", `${appName}:latest`, `${appName}:${revision}`, "-n", namespace]);
 
-  success(`Image built and tagged as ${APP_NAME}:${revision}.`);
+  success(`Image built and tagged as ${appName}:${revision}.`);
 }
 
-async function updateDeploymentImage(revision) {
+async function updateDeploymentImage(appName, namespace, revision) {
   section("Manifest - Update Image Tag");
 
-  const imageTag = `${IMAGE_BASE}:${revision}`;
+  const imageTag = `image-registry.openshift-image-registry.svc:5000/${namespace}/${appName}:${revision}`;
   info(`Updating deployment image to: ${imageTag}`);
 
   const content = fs.readFileSync(DEPLOYMENT_YAML, "utf8");
-  const updated = content.replace(
-    /^(\s*image:\s*).*$/m,
-    `$1${imageTag}`,
-  );
+  const updated = content.replace(/^(\s*image:\s*).*$/m, `$1${imageTag}`);
 
   if (content === updated) throw new Error("Image line not found in deployment.yaml — nothing updated.");
 
